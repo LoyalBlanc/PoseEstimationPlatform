@@ -19,18 +19,20 @@ def get_args_parser():
     parser.add_argument('--seed', default=42, type=int)
     parser.add_argument('--local_rank', default=0, type=int, help='node rank for distributed training')
     parser.add_argument('--output_dir', default='./checkpoints', help='path where to save, empty for no saving')
+    parser.add_argument('--resume', default='./checkpoints/0.pth')
 
     # train
     parser.add_argument('--batch_size', default=64, type=int)
-    parser.add_argument('--epoch_limit', default=100, type=int)
+    parser.add_argument('--epoch_limit', default=140, type=int)
     parser.add_argument('--lr', default=1e-3, type=float)
 
     return parser
 
 
 if __name__ == "__main__":
-    # python -m torch.distributed.launch --nproc_per_node=3 main.py
-    os.environ["CUDA_VISIBLE_DEVICES"] = "1,2,3"
+    # python -m torch.distributed.launch --nproc_per_node=2 --use_env main.py
+    GPU = [1, 2]
+    os.environ['CUDA_VISIBLE_DEVICES'] = ",".join(str(item) for item in GPU)
 
     # base
     args = get_args_parser().parse_args()
@@ -51,8 +53,12 @@ if __name__ == "__main__":
     valid_set, valid_loader = get_mpii_loader(args.batch_size, is_train=False)
 
     # model
-    model = get_pose_net(True).cuda()
-    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
+    model_without_ddp = get_pose_net(True).cuda()
+    if os.path.isfile(args.resume):
+        model_without_ddp.load_state_dict(torch.load(args.resume))
+        print(f"Successfully load {args.resume}.")
+    model = torch.nn.parallel.DistributedDataParallel(
+        model_without_ddp, device_ids=[args.gpu], find_unused_parameters=True)
 
     criterion = JointsOHKMMSELoss(True)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
@@ -87,8 +93,8 @@ if __name__ == "__main__":
                 save_batch_heatmaps(batch_images, outputs, os.path.join(args.output_dir, "train_prediction.jpg"))
                 save_batch_heatmaps(batch_images, batch_targets, os.path.join(args.output_dir, "train_gt.jpg"))
 
-        if epoch % 10 == 0:
-            torch.save(model.state_dict(), os.path.join(args.output_dir, f"{epoch}.pkl"))
+        if dist.is_main_process():
+            torch.save(model_without_ddp.state_dict(), os.path.join(args.output_dir, f"ckpt.pth"))
         lr_scheduler.step()
 
         model.eval()
@@ -111,7 +117,7 @@ if __name__ == "__main__":
                     reduced_dict_loss = dist.reduce_dict({'loss': loss})
                     reduced_dict_acc = dist.reduce_dict({'acc': avg_acc})
                     print(
-                        f"Epoch [{epoch}/{args.epoch_limit}], Valid Index [{index}/{len(train_loader)}], "
+                        f"Epoch [{epoch}/{args.epoch_limit}], Valid Index [{index}/{len(valid_loader)}], "
                         # f"Loss(Rank 0) {loss.item():.3f}, "
                         f"Loss(log-Avg) {torch.log(1e-16 + reduced_dict_loss['loss']).item():.3f}, "
                         # f"Grad norm {grad_total_norm.item():.3f}, "
@@ -125,15 +131,15 @@ if __name__ == "__main__":
         reduced_dict_eval = dist.reduce_dict(eval_result)
         print(
             f"-------- Epoch {epoch:02d} --------\n"
-            f"     Head      {reduced_dict_eval['Head'].item():.4f}\n"
-            f"     Shoulder  {reduced_dict_eval['Shoulder'].item():.4f}\n"
-            f"     Elbow     {reduced_dict_eval['Elbow'].item():.4f}\n"
-            f"     Wrist     {reduced_dict_eval['Wrist'].item():.4f}\n"
-            f"     Hip       {reduced_dict_eval['Hip'].item():.4f}\n"
-            f"     Knee      {reduced_dict_eval['Knee'].item():.4f}\n"
-            f"     Ankle     {reduced_dict_eval['Ankle'].item():.4f}\n"
+            f"     Head      {len(GPU)**2 * reduced_dict_eval['Head'].item():.4f}\n"
+            f"     Shoulder  {len(GPU)**2 * reduced_dict_eval['Shoulder'].item():.4f}\n"
+            f"     Elbow     {len(GPU)**2 * reduced_dict_eval['Elbow'].item():.4f}\n"
+            f"     Wrist     {len(GPU)**2 * reduced_dict_eval['Wrist'].item():.4f}\n"
+            f"     Hip       {len(GPU)**2 * reduced_dict_eval['Hip'].item():.4f}\n"
+            f"     Knee      {len(GPU)**2 * reduced_dict_eval['Knee'].item():.4f}\n"
+            f"     Ankle     {len(GPU)**2 * reduced_dict_eval['Ankle'].item():.4f}\n"
             f"--------------------------\n"
-            f"     Mean      {reduced_dict_eval['Mean'].item():.4f}\n"
-            f"     Mean@0.1  {reduced_dict_eval['Mean@0.1'].item():.4f}\n"
+            f"     Mean      {len(GPU)**2 * reduced_dict_eval['Mean'].item():.4f}\n"
+            f"     Mean@0.1  {len(GPU)**2 * reduced_dict_eval['Mean@0.1'].item():.4f}\n"
             f"--------------------------\n"
         )
